@@ -1,6 +1,7 @@
-pragma solidity ^0.4.18;
+pragma solidity 0.4.21;
 
-import './AMBToken.sol';
+import "./SafeMath.sol";
+import "./AMBToken.sol";
 
 contract AMBTICO is AMBToken {
     uint256 internal constant ONE_TOKEN           = 10 ** uint256(decimals);//just for convenience
@@ -21,8 +22,7 @@ contract AMBTICO is AMBToken {
     address internal owner;
     address internal bountyManager;
     address internal dividendManager;
-    address internal tokenTransferManager;
-    address internal priceManager;
+    address internal dApp;
 
     enum ContractMode {Initial, TokenSale, UnderSoftCap, DividendDistribution, Destroyed}
     ContractMode public mode = ContractMode.Initial;
@@ -32,9 +32,9 @@ contract AMBTICO is AMBToken {
     uint256 public etherCollected = 0;
 
     uint8   public currentSection = 0;
-    uint[4] public saleSectionDiscounts = [ uint8(20),10,5];
-    uint[4] public saleSectionPrice     = [ uint256(484848484848485),545454545454546,575757575757576,606060606060606];//price: 0.40 0.45 0.475 0.50 cent | ETH/USD initial rate: 825
-    uint[4] public saleSectionCount     = [ uint256(20 * MILLION),20 * MILLION,20 * MILLION,40 * MILLION - (BOUNTY_QUANTITY+RESERV_QUANTITY)];
+    uint[4] public saleSectionDiscounts = [ uint8(20), 10, 5];
+    uint[4] public saleSectionPrice     = [ uint256(484848484848485), 545454545454546, 575757575757576, 606060606060606];//price: 0.40 0.45 0.475 0.50 cent | ETH/USD initial rate: 825
+    uint[4] public saleSectionCount     = [ uint256(17 * MILLION), 20 * MILLION, 20 * MILLION, 40 * MILLION - (BOUNTY_QUANTITY+RESERV_QUANTITY)];
     uint[4] public saleSectionInvest    = [ uint256(saleSectionCount[0] * saleSectionPrice[0]),
                                                     saleSectionCount[1] * saleSectionPrice[1],
                                                     saleSectionCount[2] * saleSectionPrice[2],
@@ -44,18 +44,18 @@ contract AMBTICO is AMBToken {
     event OwnershipTransferred          (address previousOwner, address newOwner);
     event BountyManagerAssigned         (address previousBountyManager, address newBountyManager);
     event DividendManagerAssigned       (address previousDividendManager, address newDividendManager);
-    event TokenTransferManagerAssigned  (address previousTokenTransferManager, address newTokenTransferManager);
-    event PriceManagerAssigned          (address previousPriceManager, address newPriceManager);
+    event DAppAssigned                  (address previousDApp, address newDApp);
     event ModeChanged                   (ContractMode  newMode, uint256 tokenBalance);
     event DividendDeclared              (uint32 indexed dividendID, uint256 profitPerToken);
     event DividendClaimed               (address indexed investor, uint256 amount);
     event BuyBack                       (address indexed requestor);
-    event Refund                        (address indexed investor,uint256 amount);
+    event Refund                        (address indexed investor, uint256 amount);
     event Handbrake                     (ContractMode current_mode, bool functioning);
-    event FundsAdded                    (address owner,uint256 amount);
-    event FundsWithdrawal               (address owner,uint256 amount);
+    event FundsAdded                    (address owner, uint256 amount);
+    event FundsWithdrawal               (address owner, uint256 amount);
     event BountyTransfered              (address recipient, uint256 amount);
     event PriceChanged                  (uint256 newPrice);
+    event BurnToken                     (uint256 amount);
 
     modifier grantOwner() {
         require(msg.sender == owner);
@@ -72,28 +72,24 @@ contract AMBTICO is AMBToken {
         _;
     }
 
-    modifier grantTokenTransferManager() {
-        require(msg.sender == tokenTransferManager);
+    modifier grantDApp() {
+        require(msg.sender == dApp);
         _;
     }
-
-    modifier grantPriceManager() {
-        require(msg.sender == priceManager);
-        _;
-    }
-
     function AMBTICO() public {
         owner = msg.sender;
+        dividends.push(0);
     }
 
-    function setTokenPrice(uint256 new_wei_price) public grantPriceManager {
+    function setTokenPrice(uint256 new_wei_price) public grantDApp {
+        require(new_wei_price > 0);
         uint8 len = uint8(saleSectionPrice.length)-1;
         for (uint8 i=0; i<=len; i++) {
             uint256 prdsc = 100 - saleSectionDiscounts[i];
-            saleSectionPrice[i]  = (prdsc * new_wei_price ) / uint256(100);
+            saleSectionPrice[i]  = prdsc.mul(new_wei_price ).div(100);
             saleSectionInvest[i] = saleSectionPrice[i] * saleSectionCount[i];
         }
-        PriceChanged(new_wei_price);
+        emit PriceChanged(new_wei_price);
     }
 
     function startICO() public grantOwner {
@@ -107,10 +103,10 @@ contract AMBTICO is AMBToken {
         investors[bountyManager].tokenBalance   = BOUNTY_TOKENS;
         investors[owner].tokenBalance           = RESERV_TOKENS;
 
-        tokenSold = investors[bountyManager].tokenBalance + investors[owner].tokenBalance;//???
-        dividends.push(0);
+        tokenSold = investors[bountyManager].tokenBalance + investors[owner].tokenBalance;
+
         mode = ContractMode.TokenSale;
-        ModeChanged(mode, investors[this].tokenBalance);
+        emit ModeChanged(mode, investors[this].tokenBalance);
     }
 
     function getCurrentTokenPrice() public view returns(uint256) {
@@ -122,22 +118,31 @@ contract AMBTICO is AMBToken {
         invest();
     }
     function invest() public payable {
+       _invest(msg.sender,msg.value);
+    }
+    /* Used by ĐApp to accept Bitcoin transfers.*/
+    function investWithBitcoin(address ethAddress, uint256 ethWEI) public grantDApp {
+        _invest(ethAddress,ethWEI);
+    }
+
+
+    function _invest(address msg_sender, uint256 msg_value) internal {
         require(contractIsWorking);
         require(currentSection < saleSectionCount.length);
         require(mode == ContractMode.TokenSale);
-        require(msg.sender != bountyManager);
+        require(msg_sender != bountyManager);
 
-        uint wei_value = msg.value;
+        uint wei_value = msg_value;
         uint _tokens = 0;
 
         while (wei_value > 0 && (currentSection < saleSectionCount.length)) {
             if (saleSectionInvest[currentSection] >= wei_value) {
-                _tokens += (ONE_TOKEN * wei_value)/saleSectionPrice[currentSection];
+                _tokens += ONE_TOKEN.mul(wei_value).div(saleSectionPrice[currentSection]);
                 saleSectionInvest[currentSection] -= wei_value;
                 wei_value =0;
             } else {
-                _tokens += (ONE_TOKEN * saleSectionInvest[currentSection])/saleSectionPrice[currentSection];
-                wei_value -=saleSectionInvest[currentSection];
+                _tokens += ONE_TOKEN.mul(saleSectionInvest[currentSection]).div(saleSectionPrice[currentSection]);
+                wei_value -= saleSectionInvest[currentSection];
                 saleSectionInvest[currentSection] = 0;
             }
             if (saleSectionInvest[currentSection] <= 0) currentSection++;
@@ -145,25 +150,25 @@ contract AMBTICO is AMBToken {
 
         require(_tokens >= MIN_SOLD_TOKENS);
 
-        assert(_transfer(this, msg.sender, _tokens));
+        require(_transfer(this, msg_sender, _tokens));
 
-        profits[msg.sender][1] = InvestorProfitData({
-            start_balance:  investors[msg.sender].tokenBalance,
-            end_balance:    investors[msg.sender].tokenBalance,
+        profits[msg_sender][1] = InvestorProfitData({
+            start_balance:  investors[msg_sender].tokenBalance,
+            end_balance:    investors[msg_sender].tokenBalance,
             status:         ProfitStatus.StartFixed
             });
 
-        investors[msg.sender].icoInvest += (msg.value - wei_value);
+        investors[msg_sender].icoInvest += (msg_value - wei_value);
 
-        tokenSold += _tokens;
-        etherCollected += (msg.value - wei_value);
+        tokenSold      += _tokens;
+        etherCollected += (msg_value - wei_value);
 
         if (saleSectionInvest[saleSectionInvest.length-1] == 0 ) {
             _finishICO();
         }
 
         if (wei_value > 0) {
-            msg.sender.transfer(wei_value);
+            msg_sender.transfer(wei_value);
         }
     }
 
@@ -177,10 +182,11 @@ contract AMBTICO is AMBToken {
             mode = ContractMode.UnderSoftCap;
         }
 
-        icoFinishTime = now;
         investors[this].tokenBalance = 0;
-        totalSupply = tokenSold;
-        ModeChanged(mode,investors[this].tokenBalance);
+        icoFinishTime                = now;
+        totalSupply                  = tokenSold;
+
+        emit ModeChanged(mode, investors[this].tokenBalance);
     }
 
     function finishICO() public grantOwner  {
@@ -191,7 +197,7 @@ contract AMBTICO is AMBToken {
         return investors[investor].icoInvest;
     }
 
-    function activateAddress(address investor, bool status) public grantTokenTransferManager {
+    function activateAddress(address investor, bool status) public grantDApp {
         require(contractIsWorking);
         require(mode == ContractMode.DividendDistribution);
         require((now - icoFinishTime) < KYC_REVIEW_PERIOD);
@@ -215,7 +221,7 @@ contract AMBTICO is AMBToken {
         require(mode == ContractMode.DividendDistribution);
 
         dividends.push(dividendCandidate);
-        DividendDeclared(uint32(dividends.length),dividendCandidate);
+        emit DividendDeclared(uint32(dividends.length), dividendCandidate);
         dividendCandidate = 0;
     }
 
@@ -225,24 +231,25 @@ contract AMBTICO is AMBToken {
         require(investors[msg.sender].activated);
 
         InvestorProfitData storage current_profit;
-
         uint256 price_per_token;
-        (current_profit, price_per_token) = fixDividendBalances(msg.sender,true);
+        (current_profit, price_per_token) = fixDividendBalances(msg.sender, true);
 
-        uint256 investorProfitWei = (current_profit.start_balance < current_profit.end_balance ? current_profit.start_balance : current_profit.end_balance )/ONE_TOKEN * price_per_token;
+        uint256 investorProfitWei =
+                    (current_profit.start_balance < current_profit.end_balance ?
+                     current_profit.start_balance : current_profit.end_balance ).div(ONE_TOKEN).mul(price_per_token);
 
         current_profit.status = ProfitStatus.Claimed;
-        DividendClaimed(msg.sender,investorProfitWei);
+        emit DividendClaimed(msg.sender, investorProfitWei);
 
         msg.sender.transfer(investorProfitWei);
     }
 
     function getDividendInfo() public view returns(uint256) {
-        return dividends[dividends.length-1];
+        return dividends[dividends.length - 1];
     }
 
     /*******
-                BuyBack
+                emit BuyBack
     ********/
     function setBuyBackPrice(uint256 token_buyback_price) public grantOwner {
         require(mode == ContractMode.DividendDistribution);
@@ -257,10 +264,10 @@ contract AMBTICO is AMBToken {
         uint256 token_amount = investors[msg.sender].tokenBalance;
         uint256 ether_amount = calcTokenToWei(token_amount);
 
-        require(this.balance > ether_amount);
+        require(address(this).balance > ether_amount);
 
-        if (transfer(this,token_amount)){
-            BuyBack(msg.sender);
+        if (transfer(this, token_amount)){
+            emit BuyBack(msg.sender);
             msg.sender.transfer(ether_amount);
         }
     }
@@ -274,17 +281,17 @@ contract AMBTICO is AMBToken {
         require(investors[msg.sender].tokenBalance >0);
         require(investors[msg.sender].icoInvest>0);
 
-        require (this.balance > investors[msg.sender].icoInvest);
+        require (address(this).balance > investors[msg.sender].icoInvest);
 
         if (_transfer(msg.sender, this, investors[msg.sender].tokenBalance)){
-            Refund(msg.sender,investors[msg.sender].icoInvest);
+            emit Refund(msg.sender, investors[msg.sender].icoInvest);
             msg.sender.transfer(investors[msg.sender].icoInvest);
         }
     }
 
     function destroyContract() public grantOwner {
         require(mode == ContractMode.UnderSoftCap);
-        require((now - icoFinishTime)> REFUND_PERIOD);
+        require((now - icoFinishTime) > REFUND_PERIOD);
         selfdestruct(owner);
     }
     /********
@@ -294,85 +301,87 @@ contract AMBTICO is AMBToken {
     function transferOwnership(address new_owner) public grantOwner {
         require(contractIsWorking);
         require(new_owner != address(0));
-        OwnershipTransferred(owner, new_owner);
+        emit OwnershipTransferred(owner, new_owner);
         owner = new_owner;
     }
 
     function setBountyManager(address new_bounty_manager) public grantOwner {
         require(investors[new_bounty_manager].tokenBalance ==0);
         if (mode == ContractMode.Initial) {
-            BountyManagerAssigned(bountyManager, new_bounty_manager);
+            emit BountyManagerAssigned(bountyManager, new_bounty_manager);
             bountyManager = new_bounty_manager;
         } else if (mode == ContractMode.TokenSale) {
-            BountyManagerAssigned(bountyManager, new_bounty_manager);
+            emit BountyManagerAssigned(bountyManager, new_bounty_manager);
             address old_bounty_manager = bountyManager;
             bountyManager              = new_bounty_manager;
-            require(_transfer(old_bounty_manager,new_bounty_manager,investors[old_bounty_manager].tokenBalance));
+            require(_transfer(old_bounty_manager, new_bounty_manager, investors[old_bounty_manager].tokenBalance));
         } else {
             revert();
         }
     }
 
     function setDividendManager(address new_dividend_manager) public grantOwner {
-        DividendManagerAssigned(dividendManager, new_dividend_manager);
+        emit DividendManagerAssigned(dividendManager, new_dividend_manager);
         dividendManager = new_dividend_manager;
     }
 
-    function setTokenTransferManager(address new_token_transfer_manager) public grantOwner {
-        TokenTransferManagerAssigned(tokenTransferManager, new_token_transfer_manager);
-        tokenTransferManager = new_token_transfer_manager;
+    function setDApp(address new_dapp) public grantOwner {
+        emit DAppAssigned(dApp, new_dapp);
+        dApp = new_dapp;
     }
 
-    function setPriceManager(address new_price_manager) public grantOwner {
-        PriceManagerAssigned(priceManager, new_price_manager);
-        priceManager = new_price_manager;
-    }
+
+
     /********
                 Security and funds section
     ********/
-    function manualTransfer(address _to, uint256 value_tokens) public grantTokenTransferManager {
-        require(contractIsWorking);
-        require(mode == ContractMode.TokenSale || mode == ContractMode.DividendDistribution);
-        assert(_transfer(this,_to,value_tokens));
-    }
 
     function transferBounty(address _to, uint256 _amount) public grantBountyManager {
         require(contractIsWorking);
         require(mode == ContractMode.DividendDistribution);
         if (_transfer(bountyManager, _to, _amount)) {
-            BountyTransfered(_to, _amount);
+            emit BountyTransfered(_to, _amount);
         }
+    }
+
+    function burnTokens(uint256 tokenAmount) public grantOwner {
+        require(contractIsWorking);
+        require(mode == ContractMode.DividendDistribution);
+        require(investors[msg.sender].tokenBalance > tokenAmount);
+
+        investors[msg.sender].tokenBalance -= tokenAmount;
+        emit BurnToken(tokenAmount);
     }
 
     function withdrawFunds(uint wei_value) grantOwner external {
         require(mode != ContractMode.UnderSoftCap);
-        require(this.balance >= wei_value);
+        require(address(this).balance >= wei_value);
 
-        FundsWithdrawal(msg.sender, wei_value);
+        emit FundsWithdrawal(msg.sender, wei_value);
         msg.sender.transfer(wei_value);
     }
 
     function addFunds() public payable grantOwner {
         require(contractIsWorking);
-        FundsAdded(msg.sender,msg.value);
+        emit FundsAdded(msg.sender, msg.value);
     }
 
     function pauseContract() public grantOwner {
         require(contractIsWorking);
         contractIsWorking = false;
-        Handbrake(mode,contractIsWorking);
+        emit Handbrake(mode, contractIsWorking);
     }
 
     function restoreContract() public grantOwner {
         require(!contractIsWorking);
         contractIsWorking = true;
-        Handbrake(mode,contractIsWorking);
+        emit Handbrake(mode, contractIsWorking);
     }
 
     /********
                 Helper functions
     ********/
     function calcTokenToWei(uint256 token_amount) internal view returns (uint256) {
-        return (buyBackPriceWei * token_amount) / ONE_TOKEN;
+        return buyBackPriceWei.mul(token_amount).div(ONE_TOKEN);
     }
 }
